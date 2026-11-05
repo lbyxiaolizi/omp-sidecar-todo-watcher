@@ -64,8 +64,9 @@ export function createSidecarRunner(ctx: OmpExtensionContext, settings: SidecarS
     }
     if (settings.mode === 'detached') throw new Error('No detached sidecar model replied')
     if (!ctx.runEphemeralTurn) throw new Error('No sidecar watcher runner available')
+    const ephemeralPrompt = request.openingPrompt ?? request.prompt
     const { replyText, assistantMessage } = await ctx.runEphemeralTurn({
-      promptText: `${sidecarInstructions}\n\n${request.prompt}`,
+      promptText: `${sidecarInstructions}\n\n${ephemeralPrompt}`,
       minimizeEffort: true,
       signal,
     })

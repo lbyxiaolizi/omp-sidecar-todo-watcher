@@ -704,10 +704,14 @@ const phasesEntrySchema = /* @__PURE__ */ union([/* @__PURE__ */ pipe(/* @__PURE
 	})
 }), /* @__PURE__ */ transform((entry) => entry.message.details.phases))]);
 function appendStateEntry(pi, watcher) {
-	pi.appendEntry(stateEntryType, structuredClone({
-		phases: watcher.phases,
-		telemetry: watcher.telemetry
-	}));
+	const { perCallLog: _omitted, ...telemetrySummary } = watcher.telemetry;
+	pi.appendEntry(stateEntryType, {
+		phases: structuredClone(watcher.phases),
+		telemetry: {
+			...telemetrySummary,
+			lastCall: watcher.telemetry.perCallLog.at(-1)
+		}
+	});
 }
 /** The newest todo phases on a session branch: this plugin's state, user todo edits, or omp's own `todo` tool */
 function findLatestTodoPhases(branch) {
@@ -889,8 +893,9 @@ function createSidecarRunner(ctx, settings) {
 		}
 		if (settings.mode === "detached") throw new Error("No detached sidecar model replied");
 		if (!ctx.runEphemeralTurn) throw new Error("No sidecar watcher runner available");
+		const ephemeralPrompt = request.openingPrompt ?? request.prompt;
 		const { replyText, assistantMessage } = await ctx.runEphemeralTurn({
-			promptText: `${sidecarInstructions}\n\n${request.prompt}`,
+			promptText: `${sidecarInstructions}\n\n${ephemeralPrompt}`,
 			minimizeEffort: true,
 			signal
 		});
@@ -1066,6 +1071,7 @@ function readEnvironment(env) {
 }
 // src/peer-sync/broker.ts
 const stalePeerTtlMs = 9e5;
+const transientLockPattern = /locked|busy/i;
 const storedPhasesSchema = /* @__PURE__ */ fallback(/* @__PURE__ */ pipe(/* @__PURE__ */ string(), /* @__PURE__ */ parseJson(), todoPhasesSchema), []);
 const storedStringsSchema = /* @__PURE__ */ fallback(/* @__PURE__ */ pipe(/* @__PURE__ */ string(), /* @__PURE__ */ parseJson(), /* @__PURE__ */ array(/* @__PURE__ */ string())), []);
 const schemaSql = `
@@ -1115,22 +1121,36 @@ var PeerSyncBroker = class {
 	#sql;
 	constructor(dbPath, cwd) {
 		this.cwd = cwd;
-		mkdirSync(dirname(dbPath), {
+		if (dbPath !== ":memory:") mkdirSync(dirname(dbPath), {
 			recursive: true,
 			mode: 448
 		});
 		this.#db = new DatabaseSync(dbPath);
-		this.#db.exec("PRAGMA journal_mode = WAL;");
 		this.#db.exec("PRAGMA busy_timeout = 3000;");
-		for (const suffix of [
+		this.#execInitWithRetry("PRAGMA journal_mode = WAL;");
+		this.#execInitWithRetry(schemaSql);
+		if (dbPath !== ":memory:") for (const suffix of [
 			"",
 			"-wal",
 			"-shm"
 		]) try {
 			chmodSync(`${dbPath}${suffix}`, 384);
 		} catch {}
-		this.#db.exec(schemaSql);
 		this.#sql = this.#db.createTagStore();
+	}
+	/**
+	* SQLite returns SQLITE_BUSY immediately (ignoring busy_timeout) when two connections race to initialize
+	* WAL mode or DDL on a brand-new database file; retry briefly with jitter so concurrent peer startups succeed.
+	*/
+	#execInitWithRetry(sql) {
+		for (let attempt = 0;; attempt++) try {
+			this.#db.exec(sql);
+			return;
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			if (attempt >= 20 || !transientLockPattern.test(message)) throw error;
+			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10 + process$1.pid % 17 + attempt * 10);
+		}
 	}
 	registerPeer(peerId) {
 		this.#sql.run`
@@ -3501,8 +3521,18 @@ const verdictSchema = /* @__PURE__ */ pipe(/* @__PURE__ */ string(), /* @__PURE_
 	/** Exported function/type/class symbols added or modified in this write-burst */
 	exportedSymbolsChanged: nonBlankStrings
 }));
+const fencedJsonPattern = /```(?:json)?[^\S\r\n]*\r?\n([\s\S]*?)```/gi;
 /** Parses the JSON object in the sidecar's reply, tolerating surrounding prose or markdown code fences */
 function parseSidecarVerdict(replyText) {
+	for (const match of replyText.matchAll(fencedJsonPattern)) {
+		const body = match[1] ?? "";
+		const start = body.indexOf("{");
+		const end = body.lastIndexOf("}");
+		if (start !== -1 && end > start) {
+			const parsed = /* @__PURE__ */ safeParse(verdictSchema, body.slice(start, end + 1));
+			if (parsed.success) return parsed.output;
+		}
+	}
 	const json = replyText.slice(replyText.indexOf("{"), replyText.lastIndexOf("}") + 1);
 	const result = /* @__PURE__ */ safeParse(verdictSchema, json);
 	return result.success ? result.output : void 0;
@@ -3511,6 +3541,11 @@ function parseSidecarVerdict(replyText) {
 const maxStopBlocks = 3;
 /** Long enough for a prefix cache to serve most of a long list, short enough to bound what one cache miss re-bills */
 const maxTranscriptTextLength = 96e3;
+/**
+* Minimum transcript size (around the 4,096-token cacheable floor on Claude Haiku 4.5) before a replay with
+* `cacheRead === 0` and `cacheWrite === 0` is treated as a cache miss rather than pre-threshold warmup.
+*/
+const minCacheableTranscriptLength = 16e3;
 const verificationTaskPattern = /\b(?:bun\s+test|npm\s+test|pnpm\s+test|vitest|jest|pytest|cargo\s+test|go\s+test|tsc|typecheck|lint)\b|运行.*测试|跑通.*测试|验证通过/i;
 const investigationTaskPattern = /\b(?:investigate|analyze|audit|inspect|research|locate|find|diagnose|review|check|understand)\b|调研|分析|排查|审计|定位|检查|阅读|梳理|诊断/i;
 /**
@@ -3587,19 +3622,18 @@ var SidecarTodoWatcher = class {
 	onTurnEnd(content) {
 		const parts = [];
 		let textLength = 0;
-		for (const block of content) {
-			const text = block.type === "text" ? (block.text ?? "").trim() : "";
-			if (text) {
-				textLength += text.length;
-				parts.push(redactSecrets(text).slice(0, 900));
-			} else if (block.type === "toolCall" && block.name !== void 0) {
-				const intent = block.intent ?? "";
-				parts.push(redactSecrets(`ToolCall: ${block.name}${intent ? ` (${intent})` : ""}`));
-			}
+		const combinedText = content.filter((block) => block.type === "text").map((block) => (block.text ?? "").trim()).filter(Boolean).join("\n");
+		if (combinedText) {
+			textLength = combinedText.length;
+			parts.push(redactSecrets(combinedText).slice(0, 900));
+		}
+		for (const block of content) if (block.type === "toolCall" && block.name !== void 0) {
+			const intent = block.intent ?? "";
+			parts.push(redactSecrets(`ToolCall: ${block.name}${intent ? ` (${intent})` : ""}`));
 		}
 		if (parts.length === 0) return;
 		this.#burst.substantiveTextLength = Math.max(this.#burst.substantiveTextLength, textLength);
-		this.#burst.addAssistantNote(parts.join(" | ").slice(0, 1200));
+		this.#burst.addAssistantNote(redactSecrets(parts.join(" | ")).slice(0, 1200));
 	}
 	addManualTask(content) {
 		const phases = this.#phases.length > 0 ? this.#phases : [{
@@ -3642,20 +3676,21 @@ var SidecarTodoWatcher = class {
 		const burst = this.#burst;
 		this.#burst = new Burst();
 		const diff = [...burst.codeSnippets, options.gitDiff ?? ""].filter(Boolean).join("\n");
-		const prompt = this.#transcript.length === 0 ? buildOpeningPrompt({
+		const openingPrompt = buildOpeningPrompt({
 			userGoal: this.#userGoal,
 			phases: this.#phases,
 			cumulativeReadFiles: this.#cumulativeReadFiles,
 			cumulativeTouchedFiles: this.#cumulativeTouchedFiles,
 			burst,
 			diff
-		}) : buildFollowUpPrompt({
+		});
+		const prompt = this.#transcript.length === 0 ? openingPrompt : buildFollowUpPrompt({
 			userPrompt: this.#userGoal,
 			phases: this.#phases,
 			burst,
 			diff
 		});
-		const verdict = await this.#askSidecar(runner, initializing ? "init" : "delta", prompt, options.signal);
+		const verdict = await this.#askSidecar(runner, initializing ? "init" : "delta", prompt, openingPrompt, options.signal);
 		if (!verdict) return false;
 		const initTasks = initializing ? verdict.initTasks ?? [] : [];
 		if (initializing) {
@@ -3748,12 +3783,13 @@ var SidecarTodoWatcher = class {
 		this.#pendingTailNotices = [];
 		return context || void 0;
 	}
-	async #askSidecar(runner, kind, prompt, signal) {
+	async #askSidecar(runner, kind, prompt, openingPrompt, signal) {
 		const transcript = this.#transcript;
 		const startedAt = performance.now();
 		const reply = await runner({
 			transcript,
-			prompt
+			prompt,
+			openingPrompt
 		}, signal);
 		recordSidecarCall(this.telemetry, {
 			kind,
@@ -3763,7 +3799,11 @@ var SidecarTodoWatcher = class {
 			durationMs: performance.now() - startedAt
 		});
 		const verdict = parseSidecarVerdict(reply.replyText);
-		if (verdict && reply.mode === "detached-smol") this.#recordExchange(transcript, {
+		if (reply.mode !== "detached-smol") {
+			this.#transcript = [];
+			return verdict;
+		}
+		if (verdict) this.#recordExchange(transcript, {
 			prompt,
 			replyText: reply.replyText
 		}, reply.usage);
@@ -3771,7 +3811,7 @@ var SidecarTodoWatcher = class {
 	}
 	/** Extends `transcript` with the exchange, or starts the list's transcript over when resending it stops paying off */
 	#recordExchange(transcript, exchange, usage) {
-		if (transcript.length > 0 && usage.cacheRead === 0) {
+		if (transcript.length > 0 && usage.cacheRead === 0 && usage.cacheWrite === 0 && (transcript.length >= 2 || transcriptTextLength(transcript) >= minCacheableTranscriptLength)) {
 			this.#transcript = [];
 			return;
 		}

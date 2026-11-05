@@ -1,4 +1,4 @@
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { mkdtempSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -39,5 +39,20 @@ describe('peerSyncBroker', () => {
     broker.registerPeer('peer-alive')
 
     expect(broker.listOtherPeers('observer').map(peer => peer.peerId)).toEqual(['peer-alive'])
+  })
+
+  it('initializes cleanly when multiple peer processes open a brand-new database concurrently', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'peer-sync-race-'))
+    onTestFinished(() => rmSync(root, { recursive: true, force: true }))
+    const dbPath = join(root, '.omp', 'peer-sync.sqlite')
+    const script = join(import.meta.dirname, 'register-peer.ts')
+
+    const codes = await Promise.all(
+      Array.from({ length: 6 }, async (_, index) => {
+        const child = spawn(process.execPath, [script, dbPath, `peer-${index}`], { stdio: 'ignore' })
+        return new Promise<number | null>(resolve => child.on('exit', code => resolve(code)))
+      }),
+    )
+    expect(codes).toEqual([0, 0, 0, 0, 0, 0])
   })
 })

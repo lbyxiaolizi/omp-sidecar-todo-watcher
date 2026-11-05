@@ -31,8 +31,19 @@ const verdictSchema = v.pipe(
 
 export type SidecarVerdict = v.InferOutput<typeof verdictSchema>
 
+const fencedJsonPattern = /```(?:json)?[^\S\r\n]*\r?\n([\s\S]*?)```/gi
+
 /** Parses the JSON object in the sidecar's reply, tolerating surrounding prose or markdown code fences */
 export function parseSidecarVerdict(replyText: string): SidecarVerdict | undefined {
+  for (const match of replyText.matchAll(fencedJsonPattern)) {
+    const body = match[1] ?? ''
+    const start = body.indexOf('{')
+    const end = body.lastIndexOf('}')
+    if (start !== -1 && end > start) {
+      const parsed = v.safeParse(verdictSchema, body.slice(start, end + 1))
+      if (parsed.success) return parsed.output
+    }
+  }
   const json = replyText.slice(replyText.indexOf('{'), replyText.lastIndexOf('}') + 1)
   const result = v.safeParse(verdictSchema, json)
   return result.success ? result.output : undefined

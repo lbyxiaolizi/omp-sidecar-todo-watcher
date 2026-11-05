@@ -30,8 +30,13 @@ const phasesEntrySchema = v.union([
 ])
 
 export function appendStateEntry(pi: OmpExtensionAPI, watcher: SidecarTodoWatcher): void {
-  // omp keeps this object on the branch, while the watcher goes on changing its list and telemetry in place
-  pi.appendEntry(stateEntryType, structuredClone({ phases: watcher.phases, telemetry: watcher.telemetry }))
+  // omp keeps this object on the branch; snapshot the todo list and aggregate counters without cloning the
+  // growing perCallLog into every saved entry (which would retain O(N^2) call records across N saves).
+  const { perCallLog: _omitted, ...telemetrySummary } = watcher.telemetry
+  pi.appendEntry(stateEntryType, {
+    phases: structuredClone(watcher.phases),
+    telemetry: { ...telemetrySummary, lastCall: watcher.telemetry.perCallLog.at(-1) },
+  })
 }
 
 /** The newest todo phases on a session branch: this plugin's state, user todo edits, or omp's own `todo` tool */

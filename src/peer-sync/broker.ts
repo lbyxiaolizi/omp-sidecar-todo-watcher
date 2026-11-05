@@ -36,6 +36,7 @@ export interface PeerSnapshot {
 }
 
 const stalePeerTtlMs = 15 * 60 * 1000
+const transientLockPattern = /locked|busy/i
 
 const storedPhasesSchema = v.fallback(v.pipe(v.string(), v.parseJson(), todoPhasesSchema), [])
 const storedStringsSchema = v.fallback(v.pipe(v.string(), v.parseJson(), v.array(v.string())), [])
@@ -89,19 +90,40 @@ export class PeerSyncBroker {
 
   constructor(dbPath: string, cwd: string) {
     this.cwd = cwd
-    mkdirSync(dirname(dbPath), { recursive: true, mode: 0o700 })
+    if (dbPath !== ':memory:') {
+      mkdirSync(dirname(dbPath), { recursive: true, mode: 0o700 })
+    }
     this.#db = new DatabaseSync(dbPath)
-    this.#db.exec('PRAGMA journal_mode = WAL;')
     this.#db.exec('PRAGMA busy_timeout = 3000;')
-    for (const suffix of ['', '-wal', '-shm']) {
-      try {
-        chmodSync(`${dbPath}${suffix}`, 0o600)
-      } catch {
-        // Not created yet, or a filesystem without POSIX permissions
+    this.#execInitWithRetry('PRAGMA journal_mode = WAL;')
+    this.#execInitWithRetry(schemaSql)
+    if (dbPath !== ':memory:') {
+      for (const suffix of ['', '-wal', '-shm']) {
+        try {
+          chmodSync(`${dbPath}${suffix}`, 0o600)
+        } catch {
+          // Not created yet, or a filesystem without POSIX permissions
+        }
       }
     }
-    this.#db.exec(schemaSql)
     this.#sql = this.#db.createTagStore()
+  }
+
+  /**
+   * SQLite returns SQLITE_BUSY immediately (ignoring busy_timeout) when two connections race to initialize
+   * WAL mode or DDL on a brand-new database file; retry briefly with jitter so concurrent peer startups succeed.
+   */
+  #execInitWithRetry(sql: string): void {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        this.#db.exec(sql)
+        return
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        if (attempt >= 20 || !transientLockPattern.test(message)) throw error
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10 + (process.pid % 17) + attempt * 10)
+      }
+    }
   }
 
   registerPeer(peerId: string): void {

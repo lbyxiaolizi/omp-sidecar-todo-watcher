@@ -32,6 +32,8 @@ export interface SidecarReply {
 export interface SidecarRequest {
   transcript: readonly SidecarExchange[]
   prompt: string
+  /** Full opening prompt (with task goal and complete todo list) for an ephemeral fallback that never sees `transcript` */
+  openingPrompt?: string
 }
 
 export interface SidecarExchange {
@@ -53,6 +55,12 @@ const maxStopBlocks = 3
 
 /** Long enough for a prefix cache to serve most of a long list, short enough to bound what one cache miss re-bills */
 const maxTranscriptTextLength = 96_000
+
+/**
+ * Minimum transcript size (around the 4,096-token cacheable floor on Claude Haiku 4.5) before a replay with
+ * `cacheRead === 0` and `cacheWrite === 0` is treated as a cache miss rather than pre-threshold warmup.
+ */
+const minCacheableTranscriptLength = 16_000
 
 const verificationTaskPattern =
   /\b(?:bun\s+test|npm\s+test|pnpm\s+test|vitest|jest|pytest|cargo\s+test|go\s+test|tsc|typecheck|lint)\b|运行.*测试|跑通.*测试|验证通过/i
@@ -145,19 +153,26 @@ export class SidecarTodoWatcher {
   onTurnEnd(content: readonly { type: string; text?: string; name?: string; intent?: string }[]): void {
     const parts: string[] = []
     let textLength = 0
+    // Redact the concatenated text blocks first so a secret (such as a PEM private key) split across
+    // adjacent text blocks is still matched before individual blocks are truncated.
+    const combinedText = content
+      .filter(block => block.type === 'text')
+      .map(block => (block.text ?? '').trim())
+      .filter(Boolean)
+      .join('\n')
+    if (combinedText) {
+      textLength = combinedText.length
+      parts.push(redactSecrets(combinedText).slice(0, 900))
+    }
     for (const block of content) {
-      const text = block.type === 'text' ? (block.text ?? '').trim() : ''
-      if (text) {
-        textLength += text.length
-        parts.push(redactSecrets(text).slice(0, 900))
-      } else if (block.type === 'toolCall' && block.name !== undefined) {
+      if (block.type === 'toolCall' && block.name !== undefined) {
         const intent = block.intent ?? ''
         parts.push(redactSecrets(`ToolCall: ${block.name}${intent ? ` (${intent})` : ''}`))
       }
     }
     if (parts.length === 0) return
     this.#burst.substantiveTextLength = Math.max(this.#burst.substantiveTextLength, textLength)
-    this.#burst.addAssistantNote(parts.join(' | ').slice(0, 1200))
+    this.#burst.addAssistantNote(redactSecrets(parts.join(' | ')).slice(0, 1200))
   }
 
   addManualTask(content: string): TodoItem | undefined {
@@ -211,18 +226,25 @@ export class SidecarTodoWatcher {
     const burst = this.#burst
     this.#burst = new Burst()
     const diff = [...burst.codeSnippets, options.gitDiff ?? ''].filter(Boolean).join('\n')
+    const openingPrompt = buildOpeningPrompt({
+      userGoal: this.#userGoal,
+      phases: this.#phases,
+      cumulativeReadFiles: this.#cumulativeReadFiles,
+      cumulativeTouchedFiles: this.#cumulativeTouchedFiles,
+      burst,
+      diff,
+    })
     const prompt =
       this.#transcript.length === 0
-        ? buildOpeningPrompt({
-            userGoal: this.#userGoal,
-            phases: this.#phases,
-            cumulativeReadFiles: this.#cumulativeReadFiles,
-            cumulativeTouchedFiles: this.#cumulativeTouchedFiles,
-            burst,
-            diff,
-          })
+        ? openingPrompt
         : buildFollowUpPrompt({ userPrompt: this.#userGoal, phases: this.#phases, burst, diff })
-    const verdict = await this.#askSidecar(runner, initializing ? 'init' : 'delta', prompt, options.signal)
+    const verdict = await this.#askSidecar(
+      runner,
+      initializing ? 'init' : 'delta',
+      prompt,
+      openingPrompt,
+      options.signal,
+    )
     if (!verdict) return false
 
     const initTasks = initializing ? (verdict.initTasks ?? []) : []
@@ -347,11 +369,12 @@ export class SidecarTodoWatcher {
     runner: SidecarRunner,
     kind: 'init' | 'delta',
     prompt: string,
+    openingPrompt: string,
     signal: AbortSignal | undefined,
   ): Promise<SidecarVerdict | undefined> {
     const transcript = this.#transcript
     const startedAt = performance.now()
-    const reply = await runner({ transcript, prompt }, signal)
+    const reply = await runner({ transcript, prompt, openingPrompt }, signal)
     recordSidecarCall(this.telemetry, {
       kind,
       mode: reply.mode,
@@ -360,17 +383,26 @@ export class SidecarTodoWatcher {
       durationMs: performance.now() - startedAt,
     })
     const verdict = parseSidecarVerdict(reply.replyText)
-    // Ephemeral turns never send the transcript, so their prompts must stay openings
-    if (verdict && reply.mode === 'detached-smol') {
-      this.#recordExchange(transcript, { prompt, replyText: reply.replyText }, reply.usage)
+    // Ephemeral turns never send or record into the detached transcript; clear any earlier detached
+    // transcript so a later detached call starts with a fresh opening that includes this turn's changes.
+    if (reply.mode !== 'detached-smol') {
+      this.#transcript = []
+      return verdict
     }
+    if (verdict) this.#recordExchange(transcript, { prompt, replyText: reply.replyText }, reply.usage)
     return verdict
   }
 
   /** Extends `transcript` with the exchange, or starts the list's transcript over when resending it stops paying off */
   #recordExchange(transcript: SidecarExchange[], exchange: SidecarExchange, usage: ModelTokenUsage): void {
-    // A provider that served none of the replay from its cache would bill the whole transcript on every call
-    if (transcript.length > 0 && usage.cacheRead === 0) {
+    // Reset once a replay neither hits nor populates the provider cache after warming past the first replay
+    // (or once the replayed text already exceeds the cacheable-token floor).
+    if (
+      transcript.length > 0 &&
+      usage.cacheRead === 0 &&
+      usage.cacheWrite === 0 &&
+      (transcript.length >= 2 || transcriptTextLength(transcript) >= minCacheableTranscriptLength)
+    ) {
       this.#transcript = []
       return
     }

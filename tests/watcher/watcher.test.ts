@@ -81,17 +81,72 @@ describe('sidecarTodoWatcher', () => {
   })
 
   it('starts the transcript over once the provider serves none of a replay from its cache', async () => {
-    const watcher = createWatcher(createBroker(), 'peer-uncached', ['Step A', 'Step B', 'Step C'])
-    const sidecar = fakeSidecar({}, {}, {})
+    const watcher = createWatcher(createBroker(), 'peer-uncached', ['Step A', 'Step B', 'Step C', 'Step D'])
+    const sidecar = fakeSidecar({}, {}, {}, {})
     const uncachedRunner: SidecarRunner = async request => ({ ...(await sidecar.runner(request)), usage: zeroUsage })
 
-    for (const path of ['src/a.ts', 'src/b.ts', 'src/c.ts']) {
+    for (const path of ['src/a.ts', 'src/b.ts', 'src/c.ts', 'src/d.ts']) {
       watcher.onToolResult({ toolName: 'edit', input: { path }, isError: false })
       await watcher.runPass(uncachedRunner)
     }
 
-    expect(sidecar.requests.map(request => request.transcript.length)).toEqual([0, 1, 0])
-    expect(sidecar.requests[2]?.prompt).toContain('Modified files so far: src/a.ts, src/b.ts, src/c.ts')
+    expect(sidecar.requests.map(request => request.transcript.length)).toEqual([0, 1, 2, 0])
+    expect(sidecar.requests[3]?.prompt).toContain('Modified files so far: src/a.ts, src/b.ts, src/c.ts, src/d.ts')
+  })
+
+  it('keeps the transcript when a replay populates the cache (cacheWrite > 0) and resets after an ephemeral fallback', async () => {
+    const watcher = createWatcher(createBroker(), 'peer-mixed', ['Step A', 'Step B', 'Step C'])
+    const seen: Array<{ transcriptLength: number; openingPrompt?: string }> = []
+    let call = 0
+    const runner: SidecarRunner = async request => {
+      seen.push({ transcriptLength: request.transcript.length, openingPrompt: request.openingPrompt })
+      call++
+      if (call <= 2) {
+        return {
+          replyText: '```json\n{"completedTasks": []}\n```\nNote: placeholder {not_json}',
+          mode: 'detached-smol',
+          modelId: 'test/sidecar',
+          usage: { ...zeroUsage, cacheWrite: 2048 },
+        }
+      }
+      if (call === 3) {
+        return {
+          replyText: '{"completedTasks": ["#1"]}',
+          mode: 'ephemeral-shared-cache',
+          modelId: 'test/main',
+          usage: zeroUsage,
+        }
+      }
+      return {
+        replyText: '{"completedTasks": ["#2"]}',
+        mode: 'detached-smol',
+        modelId: 'test/sidecar',
+        usage: zeroUsage,
+      }
+    }
+
+    for (const path of ['src/a.ts', 'src/b.ts', 'src/c.ts', 'src/d.ts']) {
+      watcher.onToolResult({ toolName: 'edit', input: { path }, isError: false })
+      await watcher.runPass(runner)
+    }
+
+    expect(seen.map(item => item.transcriptLength)).toEqual([0, 1, 2, 0])
+    expect(seen[2]?.openingPrompt).toContain('Todo List:\n#1 [in_progress]: Step A')
+    expect(watcher.phases[0]?.tasks.map(task => task.status)).toEqual(['completed', 'completed', 'in_progress'])
+  })
+
+  it('redacts a PEM private key split across adjacent assistant text blocks', async () => {
+    const watcher = createWatcher(createBroker(), 'peer-pem', ['Rotate credentials'])
+    watcher.onTurnEnd([
+      { type: 'text', text: '-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQC7' },
+      { type: 'text', text: 'v8secretbodyxyz1234567890\n-----END PRIVATE KEY-----' },
+    ])
+    watcher.onToolResult({ toolName: 'edit', input: { path: 'src/a.ts' }, isError: false })
+    const sidecar = fakeSidecar({ completedTasks: [] })
+    await watcher.runPass(sidecar.runner)
+
+    expect(sidecar.requests[0]?.prompt).toContain('[REDACTED_PRIVATE_KEY]')
+    expect(sidecar.requests[0]?.prompt).not.toContain('v8secretbodyxyz1234567890')
   })
 
   it('starts the transcript over once it outgrows its budget', async () => {
