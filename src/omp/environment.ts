@@ -8,6 +8,8 @@ const optionalSetting = v.pipe(
 
 const environmentSchema = v.object({
   OMP_PEER_ID: optionalSetting,
+  OMP_TEAM_PEER_ID: optionalSetting,
+  OMP_TEAM_WRITE_SCOPE: optionalSetting,
   OMP_PEER_BROKER_DB: optionalSetting,
   OMP_WATCHER_MODEL: optionalSetting,
   OMP_WATCHER_MODE: v.fallback(watcherModeSchema, 'auto'),

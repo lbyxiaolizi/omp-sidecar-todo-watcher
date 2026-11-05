@@ -15,7 +15,9 @@ import {
   readToolNames,
   summarizeCodeChange,
   summarizeReadEvidence,
+  summarizeTeamTool,
   summarizeVerification,
+  teamToolNames,
   verifyToolNames,
   writeToolNames,
 } from './tool-evidence.ts'
@@ -55,12 +57,8 @@ const maxStopBlocks = 3
 
 /** Long enough for a prefix cache to serve most of a long list, short enough to bound what one cache miss re-bills */
 const maxTranscriptTextLength = 96_000
-
-/**
- * Minimum transcript size (around the 4,096-token cacheable floor on Claude Haiku 4.5) before a replay with
- * `cacheRead === 0` and `cacheWrite === 0` is treated as a cache miss rather than pre-threshold warmup.
- */
-const minCacheableTranscriptLength = 16_000
+const nonBreakingTeamMessagePattern = /^<team-message\b[^>]*>[\s\S]*?\bBreaking:\s*false\b[\s\S]*?<\/team-message>$/i
+const scopedTaskHeader = '\n# Your task\n'
 
 const verificationTaskPattern =
   /\b(?:bun\s+test|npm\s+test|pnpm\s+test|vitest|jest|pytest|cargo\s+test|go\s+test|tsc|typecheck|lint)\b|运行.*测试|跑通.*测试|验证通过/i
@@ -73,6 +71,7 @@ const investigationTaskPattern =
  */
 export class SidecarTodoWatcher {
   readonly peerId: string
+  readonly teamMode: boolean
   readonly telemetry = createUsageTelemetry()
   paused = false
   readonly #broker: PeerSyncBroker
@@ -86,8 +85,9 @@ export class SidecarTodoWatcher {
   #pendingTailNotices: string[] = []
   #stopBlockCount = 0
 
-  constructor(peerId: string, broker: PeerSyncBroker) {
+  constructor(peerId: string, broker: PeerSyncBroker, options: { teamMode?: boolean } = {}) {
     this.peerId = peerId
+    this.teamMode = options.teamMode ?? false
     this.#broker = broker
     broker.registerPeer(peerId)
   }
@@ -138,11 +138,15 @@ export class SidecarTodoWatcher {
   onUserInput(text: string): { clearedFinishedList: boolean } {
     const prompt = text.trim()
     if (!prompt || prompt.startsWith('/')) return { clearedFinishedList: false }
+    // Non-breaking `<team-message>` notifications are informational; do not wipe a finished todo list
+    // or replace the peer's assigned task goal with the notification text.
+    if (nonBreakingTeamMessagePattern.test(prompt)) return { clearedFinishedList: false }
     const clearedFinishedList = this.#phases.length > 0 && this.incompleteTasks.length === 0
     if (clearedFinishedList) this.resetTodos()
     this.#stopBlockCount = 0
     this.#burst.userPrompted = true
-    this.#userGoal = redactSecrets(prompt).slice(0, 1200)
+    const scopedGoal = extractScopedTask(prompt)
+    this.#userGoal = redactSecrets(scopedGoal === '' ? prompt : scopedGoal).slice(0, 1200)
     return { clearedFinishedList }
   }
 
@@ -202,6 +206,10 @@ export class SidecarTodoWatcher {
     const filePaths = extractFilePaths(this.#broker.cwd, input)
     if (!isError && readToolNames.has(toolName)) this.#recordRead(toolName, filePaths, input, output)
     if (!isError && writeToolNames.has(toolName)) this.#recordWrite(toolName, filePaths, input)
+    if (!isError && teamToolNames.has(toolName)) {
+      this.#burst.writes++
+      this.#burst.toolActions.push(summarizeTeamTool(toolName, input, output))
+    }
     if (verifyToolNames.has(toolName)) {
       this.#recordVerification(toolName, filePaths, input, output, isError)
     }
@@ -293,6 +301,22 @@ export class SidecarTodoWatcher {
     if (this.paused || this.#phases.length === 0) return undefined
     if (this.incompleteTasks.length > 0 && this.#burst.hasToolActivity) {
       await this.runPass(runner, { ...options, force: true })
+    }
+
+    // In multi-worktree team mode (`OMP_TEAM_PEER_ID`), the coordinator's integration gate runs full-repo
+    // verification after merging all peers' branches. If all non-verification tasks in this peer's list
+    // are already completed, auto-complete trailing verification tasks instead of blocking the peer inside
+    // its unmerged worktree.
+    if (
+      this.teamMode &&
+      this.incompleteTasks.length > 0 &&
+      this.incompleteTasks.every(task => verificationTaskPattern.test(task.content)) &&
+      allTasks(this.#phases).some(task => task.status === 'completed')
+    ) {
+      for (const task of this.incompleteTasks) task.status = 'completed'
+      this.#updatePhases(normalizePhases(this.#phases))
+      this.#stopBlockCount = 0
+      return undefined
     }
 
     const incomplete = this.incompleteTasks
@@ -395,14 +419,9 @@ export class SidecarTodoWatcher {
 
   /** Extends `transcript` with the exchange, or starts the list's transcript over when resending it stops paying off */
   #recordExchange(transcript: SidecarExchange[], exchange: SidecarExchange, usage: ModelTokenUsage): void {
-    // Reset once a replay neither hits nor populates the provider cache after warming past the first replay
-    // (or once the replayed text already exceeds the cacheable-token floor).
-    if (
-      transcript.length > 0 &&
-      usage.cacheRead === 0 &&
-      usage.cacheWrite === 0 &&
-      (transcript.length >= 2 || transcriptTextLength(transcript) >= minCacheableTranscriptLength)
-    ) {
+    // A provider that neither served from cache nor wrote to cache on a replay would re-bill the growing
+    // transcript on every call; reset immediately so non-caching providers stay compact.
+    if (transcript.length > 0 && usage.cacheRead === 0 && usage.cacheWrite === 0) {
       this.#transcript = []
       return
     }
@@ -429,6 +448,14 @@ export class SidecarTodoWatcher {
 
 function transcriptTextLength(transcript: readonly SidecarExchange[]): number {
   return transcript.reduce((length, exchange) => length + exchange.prompt.length + exchange.replyText.length, 0)
+}
+
+function extractScopedTask(prompt: string): string {
+  const start = prompt.indexOf(scopedTaskHeader)
+  if (start === -1) return ''
+  const body = prompt.slice(start + scopedTaskHeader.length)
+  const nextSection = body.indexOf('\n# ')
+  return (nextSection === -1 ? body : body.slice(0, nextSection)).trim()
 }
 
 /** Appends the contents not on the list yet, ignoring case, to `targetPhase` as pending tasks and returns them */

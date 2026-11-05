@@ -81,17 +81,17 @@ describe('sidecarTodoWatcher', () => {
   })
 
   it('starts the transcript over once the provider serves none of a replay from its cache', async () => {
-    const watcher = createWatcher(createBroker(), 'peer-uncached', ['Step A', 'Step B', 'Step C', 'Step D'])
-    const sidecar = fakeSidecar({}, {}, {}, {})
+    const watcher = createWatcher(createBroker(), 'peer-uncached', ['Step A', 'Step B', 'Step C'])
+    const sidecar = fakeSidecar({}, {}, {})
     const uncachedRunner: SidecarRunner = async request => ({ ...(await sidecar.runner(request)), usage: zeroUsage })
 
-    for (const path of ['src/a.ts', 'src/b.ts', 'src/c.ts', 'src/d.ts']) {
+    for (const path of ['src/a.ts', 'src/b.ts', 'src/c.ts']) {
       watcher.onToolResult({ toolName: 'edit', input: { path }, isError: false })
       await watcher.runPass(uncachedRunner)
     }
 
-    expect(sidecar.requests.map(request => request.transcript.length)).toEqual([0, 1, 2, 0])
-    expect(sidecar.requests[3]?.prompt).toContain('Modified files so far: src/a.ts, src/b.ts, src/c.ts, src/d.ts')
+    expect(sidecar.requests.map(request => request.transcript.length)).toEqual([0, 1, 0])
+    expect(sidecar.requests[2]?.prompt).toContain('Modified files so far: src/a.ts, src/b.ts, src/c.ts')
   })
 
   it('keeps the transcript when a replay populates the cache (cacheWrite > 0) and resets after an ephemeral fallback', async () => {
@@ -147,6 +147,44 @@ describe('sidecarTodoWatcher', () => {
 
     expect(sidecar.requests[0]?.prompt).toContain('[REDACTED_PRIVATE_KEY]')
     expect(sidecar.requests[0]?.prompt).not.toContain('v8secretbodyxyz1234567890')
+  })
+
+  it('records team host tools, ignores non-breaking team messages, and auto-completes trailing verification in team mode', async () => {
+    const watcher = new SidecarTodoWatcher('backend', createBroker(), { teamMode: true })
+    watcher.onUserInput(
+      '# Team goal\nMake bun test pass.\n\n# Your task\nImplement finalPrice and announce contract.\n\n# Teammates\n- @frontend',
+    )
+    watcher.restore([
+      {
+        name: 'Tasks',
+        tasks: [
+          { content: 'Announce contract via propose_contract_change', status: 'pending' },
+          { content: 'Run bun test to verify all tests pass', status: 'pending' },
+        ],
+      },
+    ])
+
+    watcher.onToolResult({
+      toolName: 'propose_contract_change',
+      input: { contract_name: 'price', summary: 'cents' },
+      output: 'Notified: @frontend',
+      isError: false,
+    })
+    const sidecar = fakeSidecar({ completedTasks: ['#1'] })
+    await watcher.runPass(sidecar.runner)
+    expect(sidecar.requests[0]?.prompt).toContain('propose_contract_change(price) -> Notified: @frontend')
+
+    // In team mode, trailing verification-only todos do not block session_stop after implementation todos complete.
+    expect(await watcher.evaluateStopGate(sidecar.runner)).toBeUndefined()
+    expect(watcher.incompleteTasks).toHaveLength(0)
+
+    // Non-breaking <team-message> notification must not wipe the finished todo list.
+    expect(
+      watcher.onUserInput(
+        '<team-message from="@frontend" kind="contract_change">\nAdded format\nBreaking: false\n</team-message>',
+      ),
+    ).toEqual({ clearedFinishedList: false })
+    expect(watcher.phases[0]?.tasks).toHaveLength(2)
   })
 
   it('starts the transcript over once it outgrows its budget', async () => {

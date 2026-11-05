@@ -777,14 +777,14 @@ const sidecarInstructions = [
 	"You are a fast, deterministic JSON-only code-progress judge for a coding agent's todo list. Each user message reports the agent's activity since the previous one. Do not think or explain; output ONLY a raw JSON object starting with '{' and ending with '}'.",
 	"",
 	"[WHEN THERE IS NO TODO LIST YET]",
-	"Extract 2 to 6 concrete, verifiable engineering todo items in execution order (`initTasks` array).",
+	"Extract 2 to 4 concrete engineering todo items strictly for THIS agent's assigned task and write scope (`initTasks` array). Do NOT invent extra whole-repo test suite items when the agent only owns a scoped module in a team worktree.",
 	"If any step is ALREADY fully implemented/verified by the reported tool actions, list its 1-based ID (e.g. \"#1\") in `completedTasks`.",
 	"Reply format: {\"initTasks\": [\"step 1\", \"step 2\"], \"completedTasks\": [\"#1\"], \"milestoneSummary\": null, \"exportedSymbolsChanged\": []}",
 	"",
 	"[EVALUATION RULES FOR AN EXISTING TODO LIST]",
 	"1. Mark an open item in `completedTasks` (by ID like \"#1\") ONLY if every function/requirement named in that item is implemented and verified in the reported code/actions.",
 	"2. For investigation/analysis/audit items (e.g. 'Analyze X', 'Locate root cause'), mark completed ONLY if the target files were read AND the 'Main Agent Notes & Analytical Findings' contain the concrete analytical conclusion/findings (or the agent has already moved on to implementing the fix).",
-	"3. Never mark a test/verification item completed if the test command has not run yet or failed.",
+	"3. Never mark a test/verification item completed if the test command has not run yet or failed (unless the failure is solely in other teammates' unmerged modules outside this agent's scope).",
 	"4. If the user added new requirements, list in `appendTasks`; if an item is obsolete, list in `dropTasks`.",
 	"5. If shared exports/signatures changed or a key investigation finding affects peers, write a 1-sentence `milestoneSummary` and list `exportedSymbolsChanged`.",
 	"Reply format: {\"completedTasks\": [\"#1\"], \"appendTasks\": [], \"dropTasks\": [], \"milestoneSummary\": null, \"exportedSymbolsChanged\": []}"
@@ -1061,6 +1061,8 @@ function runPeerTodosCommand(rawArgs, session, ctx) {
 const optionalSetting = /* @__PURE__ */ pipe(/* @__PURE__ */ optional(/* @__PURE__ */ string()), /* @__PURE__ */ transform((value) => value === "" ? void 0 : value));
 const environmentSchema = /* @__PURE__ */ object({
 	OMP_PEER_ID: optionalSetting,
+	OMP_TEAM_PEER_ID: optionalSetting,
+	OMP_TEAM_WRITE_SCOPE: optionalSetting,
 	OMP_PEER_BROKER_DB: optionalSetting,
 	OMP_WATCHER_MODEL: optionalSetting,
 	OMP_WATCHER_MODE: /* @__PURE__ */ fallback(watcherModeSchema, "auto")
@@ -3322,6 +3324,11 @@ const verifyToolNames = /* @__PURE__ */ new Set([
 	"eval",
 	"lsp"
 ]);
+const teamToolNames = /* @__PURE__ */ new Set([
+	"consult_peer",
+	"propose_contract_change",
+	"critique_peer"
+]);
 const declarationLinePattern = /^\s*(?:export\s+(?:default\s+)?(?:async\s+)?(?:function|class|interface|type|const|let|enum)\s+\w+|(?:async\s+)?function\s+\w+|class\s+\w+|def\s+\w+|pub\s+(?:async\s+)?(?:fn|struct|enum|trait)\s+\w+|func\s+\w+|describe\s*\(|test\s*\(|it\s*\()/;
 const patchFileHeaders = [
 	"*** Update File:",
@@ -3338,7 +3345,12 @@ const toolInputSchema = /* @__PURE__ */ object({
 	content: optionalText,
 	command: optionalText,
 	pattern: optionalText,
-	query: optionalText
+	query: optionalText,
+	target_peer: optionalText,
+	summary: optionalText,
+	question: optionalText,
+	finding: optionalText,
+	contract_name: optionalText
 });
 function parseToolInput(input) {
 	return parse(toolInputSchema, input);
@@ -3386,7 +3398,13 @@ function summarizeCodeChange(label, toolName, rawContent) {
 * without sending thousands of tokens of raw file contents.
 */
 function summarizeReadEvidence(toolName, filePaths, input, rawOutput) {
-	const target = filePaths.join(", ") || (input.pattern !== void 0 ? `pattern:${input.pattern}` : "") || (input.query !== void 0 ? `query:${input.query}` : "") || toolName;
+	const uriTarget = [
+		input.path,
+		input.file,
+		input.filePath,
+		input.targetFile
+	].find((path) => path !== void 0 && path.includes("://"));
+	const target = filePaths.join(", ") || (uriTarget ?? "") || (input.pattern !== void 0 ? `pattern:${input.pattern}` : "") || (input.query !== void 0 ? `query:${input.query}` : "") || toolName;
 	if (filePaths.some(isSensitiveFilePath)) return `${toolName}(${target}) -> [REDACTED_SENSITIVE_FILE]`;
 	if (rawOutput === void 0 || rawOutput.trim() === "") return `${toolName}(${target}) -> read ok`;
 	const sanitized = redactSecrets(rawOutput);
@@ -3405,6 +3423,9 @@ function summarizeVerification(toolName, input, filePaths, rawOutput, failed) {
 	const command = input.command === void 0 ? filePaths.join(", ") || toolName : redactSecrets(input.command).slice(0, 80);
 	const outputTail = rawOutput !== void 0 && rawOutput !== "" ? ` | ${failed ? "error" : "output"}: ${collapseWhitespace(redactSecrets(rawOutput)).slice(-160)}` : "";
 	return `${toolName}(${JSON.stringify(command)}) -> ${failed ? "FAILED" : "ok (exit 0)"}${outputTail}`;
+}
+function summarizeTeamTool(toolName, input, rawOutput) {
+	return `${toolName}(${input.target_peer ?? input.contract_name ?? input.file ?? input.summary?.slice(0, 60) ?? input.question?.slice(0, 60) ?? ""})${rawOutput !== void 0 && rawOutput !== "" ? ` -> ${collapseWhitespace(redactSecrets(rawOutput)).slice(0, 120)}` : " -> ok"}`;
 }
 // src/peer-sync/notices.ts
 /**
@@ -3541,11 +3562,8 @@ function parseSidecarVerdict(replyText) {
 const maxStopBlocks = 3;
 /** Long enough for a prefix cache to serve most of a long list, short enough to bound what one cache miss re-bills */
 const maxTranscriptTextLength = 96e3;
-/**
-* Minimum transcript size (around the 4,096-token cacheable floor on Claude Haiku 4.5) before a replay with
-* `cacheRead === 0` and `cacheWrite === 0` is treated as a cache miss rather than pre-threshold warmup.
-*/
-const minCacheableTranscriptLength = 16e3;
+const nonBreakingTeamMessagePattern = /^<team-message\b[^>]*>[\s\S]*?\bBreaking:\s*false\b[\s\S]*?<\/team-message>$/i;
+const scopedTaskHeader = "\n# Your task\n";
 const verificationTaskPattern = /\b(?:bun\s+test|npm\s+test|pnpm\s+test|vitest|jest|pytest|cargo\s+test|go\s+test|tsc|typecheck|lint)\b|运行.*测试|跑通.*测试|验证通过/i;
 const investigationTaskPattern = /\b(?:investigate|analyze|audit|inspect|research|locate|find|diagnose|review|check|understand)\b|调研|分析|排查|审计|定位|检查|阅读|梳理|诊断/i;
 /**
@@ -3553,6 +3571,7 @@ const investigationTaskPattern = /\b(?:investigate|analyze|audit|inspect|researc
 */
 var SidecarTodoWatcher = class {
 	peerId;
+	teamMode;
 	telemetry = createUsageTelemetry();
 	paused = false;
 	#broker;
@@ -3565,8 +3584,9 @@ var SidecarTodoWatcher = class {
 	#userGoal = "";
 	#pendingTailNotices = [];
 	#stopBlockCount = 0;
-	constructor(peerId, broker) {
+	constructor(peerId, broker, options = {}) {
 		this.peerId = peerId;
+		this.teamMode = options.teamMode ?? false;
 		this.#broker = broker;
 		broker.registerPeer(peerId);
 	}
@@ -3608,11 +3628,13 @@ var SidecarTodoWatcher = class {
 	onUserInput(text) {
 		const prompt = text.trim();
 		if (!prompt || prompt.startsWith("/")) return { clearedFinishedList: false };
+		if (nonBreakingTeamMessagePattern.test(prompt)) return { clearedFinishedList: false };
 		const clearedFinishedList = this.#phases.length > 0 && this.incompleteTasks.length === 0;
 		if (clearedFinishedList) this.resetTodos();
 		this.#stopBlockCount = 0;
 		this.#burst.userPrompted = true;
-		this.#userGoal = redactSecrets(prompt).slice(0, 1200);
+		const scopedGoal = extractScopedTask(prompt);
+		this.#userGoal = redactSecrets(scopedGoal === "" ? prompt : scopedGoal).slice(0, 1200);
 		return { clearedFinishedList };
 	}
 	/**
@@ -3661,6 +3683,10 @@ var SidecarTodoWatcher = class {
 		const filePaths = extractFilePaths(this.#broker.cwd, input);
 		if (!isError && readToolNames.has(toolName)) this.#recordRead(toolName, filePaths, input, output);
 		if (!isError && writeToolNames.has(toolName)) this.#recordWrite(toolName, filePaths, input);
+		if (!isError && teamToolNames.has(toolName)) {
+			this.#burst.writes++;
+			this.#burst.toolActions.push(summarizeTeamTool(toolName, input, output));
+		}
 		if (verifyToolNames.has(toolName)) this.#recordVerification(toolName, filePaths, input, output, isError);
 		return this.#takePendingContext();
 	}
@@ -3731,6 +3757,12 @@ var SidecarTodoWatcher = class {
 			...options,
 			force: true
 		});
+		if (this.teamMode && this.incompleteTasks.length > 0 && this.incompleteTasks.every((task) => verificationTaskPattern.test(task.content)) && allTasks(this.#phases).some((task) => task.status === "completed")) {
+			for (const task of this.incompleteTasks) task.status = "completed";
+			this.#updatePhases(normalizePhases(this.#phases));
+			this.#stopBlockCount = 0;
+			return;
+		}
 		const incomplete = this.incompleteTasks;
 		if (incomplete.length === 0) {
 			this.#stopBlockCount = 0;
@@ -3811,7 +3843,7 @@ var SidecarTodoWatcher = class {
 	}
 	/** Extends `transcript` with the exchange, or starts the list's transcript over when resending it stops paying off */
 	#recordExchange(transcript, exchange, usage) {
-		if (transcript.length > 0 && usage.cacheRead === 0 && usage.cacheWrite === 0 && (transcript.length >= 2 || transcriptTextLength(transcript) >= minCacheableTranscriptLength)) {
+		if (transcript.length > 0 && usage.cacheRead === 0 && usage.cacheWrite === 0) {
 			this.#transcript = [];
 			return;
 		}
@@ -3830,6 +3862,13 @@ var SidecarTodoWatcher = class {
 };
 function transcriptTextLength(transcript) {
 	return transcript.reduce((length, exchange) => length + exchange.prompt.length + exchange.replyText.length, 0);
+}
+function extractScopedTask(prompt) {
+	const start = prompt.indexOf(scopedTaskHeader);
+	if (start === -1) return "";
+	const body = prompt.slice(start + 13);
+	const nextSection = body.indexOf("\n# ");
+	return (nextSection === -1 ? body : body.slice(0, nextSection)).trim();
 }
 /** Appends the contents not on the list yet, ignoring case, to `targetPhase` as pending tasks and returns them */
 function appendNewTasks(phases, targetPhase, contents) {
@@ -3894,11 +3933,11 @@ function sidecarTodoWatcherExtension(pi) {
 		return activeTools.length === 0 || activeTools.some((tool) => writeToolNames.has(tool) || tool === "bash" || tool === "eval");
 	}
 	function sessionFor(ctx) {
-		const peerId = (environment.OMP_PEER_ID ?? ctx.sessionManager.getSessionId()).slice(0, 24);
+		const peerId = (environment.OMP_TEAM_PEER_ID ?? environment.OMP_PEER_ID ?? ctx.sessionManager.getSessionId()).slice(0, 24);
 		if (session?.watcher.peerId === peerId) return session;
 		const broker = session?.broker ?? new PeerSyncBroker(environment.OMP_PEER_BROKER_DB ?? join(ctx.cwd, ".omp", "peer-sync.sqlite"), ctx.cwd);
 		if (session) endSession(session);
-		const watcher = new SidecarTodoWatcher(peerId, broker);
+		const watcher = new SidecarTodoWatcher(peerId, broker, { teamMode: environment.OMP_TEAM_PEER_ID !== void 0 || environment.OMP_TEAM_WRITE_SCOPE !== void 0 });
 		watcher.restore(findLatestTodoPhases(ctx.sessionManager.getBranch()));
 		session = {
 			broker,

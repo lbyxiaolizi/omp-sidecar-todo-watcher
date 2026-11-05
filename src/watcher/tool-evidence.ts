@@ -6,6 +6,7 @@ import { collapseWhitespace, countLeadingDigits } from '../text.ts'
 export const readToolNames = new Set(['read', 'grep', 'glob', 'lsp', 'web_search'])
 export const writeToolNames = new Set(['edit', 'write', 'ast_edit', 'apply_patch'])
 export const verifyToolNames = new Set(['bash', 'eval', 'lsp'])
+export const teamToolNames = new Set(['consult_peer', 'propose_contract_change', 'critique_peer'])
 
 const declarationLinePattern =
   /^\s*(?:export\s+(?:default\s+)?(?:async\s+)?(?:function|class|interface|type|const|let|enum)\s+\w+|(?:async\s+)?function\s+\w+|class\s+\w+|def\s+\w+|pub\s+(?:async\s+)?(?:fn|struct|enum|trait)\s+\w+|func\s+\w+|describe\s*\(|test\s*\(|it\s*\()/
@@ -24,6 +25,11 @@ const toolInputSchema = v.object({
   command: optionalText,
   pattern: optionalText,
   query: optionalText,
+  target_peer: optionalText,
+  summary: optionalText,
+  question: optionalText,
+  finding: optionalText,
+  contract_name: optionalText,
 })
 
 /** The tool arguments the watcher reads, with any non-string value dropped */
@@ -93,8 +99,12 @@ export function summarizeReadEvidence(
   input: ToolInput,
   rawOutput: string | undefined,
 ): string {
+  const uriTarget = [input.path, input.file, input.filePath, input.targetFile].find(
+    (path): path is string => path !== undefined && path.includes('://'),
+  )
   const target =
     filePaths.join(', ') ||
+    (uriTarget ?? '') ||
     (input.pattern !== undefined ? `pattern:${input.pattern}` : '') ||
     (input.query !== undefined ? `query:${input.query}` : '') ||
     toolName
@@ -140,4 +150,19 @@ export function summarizeVerification(
       ? ` | ${failed ? 'error' : 'output'}: ${collapseWhitespace(redactSecrets(rawOutput)).slice(-160)}`
       : ''
   return `${toolName}(${JSON.stringify(command)}) -> ${failed ? 'FAILED' : 'ok (exit 0)'}${outputTail}`
+}
+
+export function summarizeTeamTool(toolName: string, input: ToolInput, rawOutput: string | undefined): string {
+  const detail =
+    input.target_peer ??
+    input.contract_name ??
+    input.file ??
+    input.summary?.slice(0, 60) ??
+    input.question?.slice(0, 60) ??
+    ''
+  const tail =
+    rawOutput !== undefined && rawOutput !== ''
+      ? ` -> ${collapseWhitespace(redactSecrets(rawOutput)).slice(0, 120)}`
+      : ' -> ok'
+  return `${toolName}(${detail})${tail}`
 }

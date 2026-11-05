@@ -45,14 +45,17 @@ export default function sidecarTodoWatcherExtension(pi: OmpExtensionAPI): void {
   }
 
   function sessionFor(ctx: OmpExtensionContext): Session {
-    const peerId = (environment.OMP_PEER_ID ?? ctx.sessionManager.getSessionId()).slice(0, 24)
+    const teamPeerId = environment.OMP_TEAM_PEER_ID ?? environment.OMP_PEER_ID
+    const peerId = (teamPeerId ?? ctx.sessionManager.getSessionId()).slice(0, 24)
     if (session?.watcher.peerId === peerId) return session
     const broker =
       session?.broker ??
       new PeerSyncBroker(environment.OMP_PEER_BROKER_DB ?? join(ctx.cwd, '.omp', 'peer-sync.sqlite'), ctx.cwd)
     // The previous session of this process is gone
     if (session) endSession(session)
-    const watcher = new SidecarTodoWatcher(peerId, broker)
+    const watcher = new SidecarTodoWatcher(peerId, broker, {
+      teamMode: environment.OMP_TEAM_PEER_ID !== undefined || environment.OMP_TEAM_WRITE_SCOPE !== undefined,
+    })
     watcher.restore(findLatestTodoPhases(ctx.sessionManager.getBranch()))
     session = { broker, watcher, ended: new AbortController(), rerunRequested: false }
     return session
