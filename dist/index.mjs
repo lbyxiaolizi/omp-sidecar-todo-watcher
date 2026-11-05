@@ -726,49 +726,140 @@ const plainTheme = {
 	fg: (_color, text) => text,
 	strikethrough: (text) => text
 };
-const maxVisibleTasks = 5;
-function refreshUi(ctx, { broker, watcher }) {
+const compactTaskLimit = 5;
+const expandedTaskLimit = 8;
+const progressBarWidth = 6;
+function refreshUi(ctx, { broker, watcher, view = "compact", checking = false }) {
 	if (!ctx.hasUI) return;
-	const lines = renderHudLines(watcher, broker.listOtherPeers(watcher.peerId), ctx.ui.theme);
+	const peers = broker.listOtherPeers(watcher.peerId);
+	const lines = renderHudLines(watcher, peers, ctx.ui.theme, {
+		view,
+		checking
+	});
 	ctx.ui.setWidget("sidecar-todo-watcher", lines.length > 0 ? lines : void 0, { placement: "aboveEditor" });
-	ctx.ui.setStatus("sidecar-todo", renderStatusText(watcher));
+	ctx.ui.setStatus("sidecar-todo", renderStatusText(watcher, peers.length, checking));
 }
 /**
-* Renders a multi-line TUI widget showing managed Todos (with checkboxes & theme colors) + Peer Team activity.
+* Renders a multi-line TUI widget showing managed Todos (with progress bar, smart active windowing,
+* checkboxes & theme colors) + Peer Team activity and latest `<peer-sync>` event.
 */
-function renderHudLines(watcher, peers, theme = plainTheme) {
+function renderHudLines(watcher, peers, theme = plainTheme, options = {}) {
+	const { view = "compact", checking = false } = options;
 	const tasks = allTasks(watcher.phases);
 	const lines = [];
 	if (tasks.length > 0) {
 		const done = tasks.filter((task) => task.status === "completed").length;
 		const active = watcher.activeTask;
+		const bar = renderProgressBar(done, tasks.length, theme);
+		const phaseBadge = renderActivePhaseBadge(watcher.phases, theme);
 		const pauseBadge = watcher.paused ? theme.fg("warning", " [PAUSED]") : "";
-		const { telemetry } = watcher;
-		const telemetryBadge = telemetry.calls > 0 ? theme.fg("dim", ` · Watcher(${telemetry.lastModelId ?? telemetry.mode}): ${telemetry.calls} calls, ${telemetry.totalTokens} tok, ${(telemetry.cacheHitRate * 100).toFixed(1)}% cache ($${telemetry.totalCostUsd.toFixed(4)})`) : "";
-		lines.push(`${theme.fg("accent", "[Sidecar Todo]")} ${done}/${tasks.length} done${pauseBadge}${active ? ` · Active (${active.id}): ${active.content}` : ` · ${theme.fg("success", "All complete ✓")}`}${telemetryBadge}`);
-		for (const task of tasks.slice(0, maxVisibleTasks)) lines.push(`  ${renderTask(task, theme)}`);
-		if (tasks.length > maxVisibleTasks) lines.push(`  ${theme.fg("dim", `… +${tasks.length - maxVisibleTasks} more todo(s)`)}`);
-	}
+		const checkingBadge = checking ? theme.fg("accent", " · ⟳ auditing…") : "";
+		const telemetryBadge = renderTelemetryBadge(watcher, theme);
+		lines.push(`${theme.fg("accent", "[Sidecar Todo]")} ${bar} ${phaseBadge}${done}/${tasks.length} done${pauseBadge}${active ? ` · Active (${active.id}): ${active.content}` : ` · ${theme.fg("success", "All complete ✓")}`}${checkingBadge}${telemetryBadge}`);
+		if (view !== "minimal") {
+			const limit = view === "expanded" ? expandedTaskLimit : compactTaskLimit;
+			const { visible, hiddenAbove, hiddenBelow } = selectVisibleWindow(tagTasksWithPhase(watcher.phases), limit);
+			if (hiddenAbove > 0) lines.push(`  ${theme.fg("dim", `↑ +${hiddenAbove} completed todo(s) above`)}`);
+			for (const item of visible) lines.push(`  ${renderTask(item.task, theme, item.phaseName)}`);
+			if (hiddenBelow > 0) lines.push(`  ${theme.fg("dim", `… +${hiddenBelow} more todo(s)`)}`);
+		}
+		if (view === "expanded" && watcher.archivedBatches.length > 0) lines.push(`  ${theme.fg("dim", `Archived lists in session: ${watcher.archivedBatches.length}`)}`);
+	} else if (checking) lines.push(`${theme.fg("accent", "[Sidecar Todo]")} ${theme.fg("dim", "⟳ extracting initial todo plan…")}`);
 	if (peers.length > 0) {
-		const peerSummary = peers.map((peer) => `@${peer.peerId}(${peer.completedCount}/${peer.totalCount}${peer.activeTask === null ? "" : `: ${peer.activeTask}`})`).join(" | ");
-		lines.push(`${theme.fg("accent", "[Peers]")} ${peerSummary}`);
+		if (view === "expanded") {
+			lines.push(`${theme.fg("accent", "[Peers]")} ${peers.length} active teammate(s):`);
+			for (const peer of peers) lines.push(`  ${renderPeerBadge(peer, theme)}`);
+		} else {
+			const peerSummary = peers.map((peer) => renderPeerBadge(peer, theme)).join(" | ");
+			lines.push(`${theme.fg("accent", "[Peers]")} ${peerSummary}`);
+		}
+	}
+	if (watcher.lastPeerSync && view !== "minimal" && (tasks.length > 0 || peers.length > 0)) {
+		const sync = watcher.lastPeerSync;
+		const summary = sync.summary.length > 90 ? `${sync.summary.slice(0, 87)}…` : sync.summary;
+		lines.push(`  ${theme.fg("dim", `↳ Peer sync (@${sync.fromPeerId}): ${summary}`)}`);
 	}
 	return lines;
 }
-function renderStatusText(watcher) {
+function renderStatusText(watcher, peerCount = 0, checking = false) {
 	const tasks = allTasks(watcher.phases);
-	if (tasks.length === 0) return void 0;
+	if (tasks.length === 0) return checking ? "Todo ⟳" : void 0;
 	const done = tasks.filter((task) => task.status === "completed").length;
 	const active = watcher.activeTask;
-	return `Todo ${done}/${tasks.length}${watcher.paused ? " (paused)" : active ? ` (${active.id})` : " ✓"}`;
+	const stateSuffix = watcher.paused ? " (paused)" : active ? ` (${active.id})` : " ✓";
+	const peerSuffix = peerCount > 0 ? ` · ${peerCount}p` : "";
+	const spinSuffix = checking ? " ⟳" : "";
+	return `Todo ${done}/${tasks.length}${stateSuffix}${peerSuffix}${spinSuffix}`;
 }
-function renderTask(task, theme) {
+/**
+* Selects a window of up to `limit` tasks anchored around the first `in_progress` (or first incomplete) task
+* so long lists never hide the active task behind already-completed items.
+*/
+function selectVisibleWindow(items, limit) {
+	if (items.length <= limit) return {
+		visible: [...items],
+		hiddenAbove: 0,
+		hiddenBelow: 0
+	};
+	const focusIndex = items.findIndex((item) => item.task.status === "in_progress" || item.task.status === "blocked" || item.task.status === "pending");
+	const anchor = focusIndex === -1 ? items.length - limit : Math.max(0, focusIndex - 1);
+	const start = Math.min(anchor, Math.max(0, items.length - limit));
+	const end = Math.min(items.length, start + limit);
+	return {
+		visible: items.slice(start, end),
+		hiddenAbove: start,
+		hiddenBelow: items.length - end
+	};
+}
+function renderProgressBar(done, total, theme) {
+	const filled = total > 0 ? Math.round(done / total * progressBarWidth) : 0;
+	const donePart = "█".repeat(filled);
+	const restPart = "░".repeat(Math.max(0, progressBarWidth - filled));
+	return `[${`${done === total ? theme.fg("success", donePart) : theme.fg("accent", donePart)}${theme.fg("dim", restPart)}`}]`;
+}
+function renderActivePhaseBadge(phases, theme) {
+	if (phases.length <= 1) return "";
+	const activeIndex = phases.findIndex((phase) => phase.tasks.some((task) => task.status === "in_progress" || task.status === "pending" || task.status === "blocked"));
+	const index = activeIndex === -1 ? phases.length - 1 : activeIndex;
+	const phase = phases[index];
+	return `${theme.fg("muted", `[${index + 1}/${phases.length} ${phase.name}]`)} `;
+}
+function renderTelemetryBadge(watcher, theme) {
+	const { telemetry } = watcher;
+	if (telemetry.calls === 0) return "";
+	const shortModel = shortenModelId(telemetry.lastModelId ?? telemetry.mode);
+	const hitRate = telemetry.warmCacheHitRate > 0 ? telemetry.warmCacheHitRate : telemetry.cacheHitRate;
+	const latency = telemetry.lastDurationMs === void 0 ? "" : `, ${(telemetry.lastDurationMs / 1e3).toFixed(1)}s`;
+	return theme.fg("dim", ` · Watcher(${shortModel}): ${telemetry.calls} calls, ${telemetry.totalTokens} tok, ${(hitRate * 100).toFixed(1)}% cache ($${telemetry.totalCostUsd.toFixed(4)}${latency})`);
+}
+function shortenModelId(modelId) {
+	const parts = modelId.split("/");
+	return parts.length > 2 ? parts.slice(-2).join("/") : modelId;
+}
+function tagTasksWithPhase(phases) {
+	const multiPhase = phases.length > 1;
+	return phases.flatMap((phase) => phase.tasks.map((task) => ({
+		task,
+		phaseName: multiPhase ? phase.name : void 0
+	})));
+}
+function renderPeerBadge(peer, theme) {
+	const allDone = peer.totalCount > 0 && peer.completedCount === peer.totalCount;
+	const progress = `${peer.completedCount}/${peer.totalCount}`;
+	const detail = peer.activeTask === null ? allDone ? " ✓" : "" : `: ${peer.activeTask}`;
+	const text = `@${peer.peerId}(${progress}${detail})`;
+	if (allDone) return theme.fg("success", text);
+	if (peer.activeTask !== null) return theme.fg("accent", text);
+	return theme.fg("muted", text);
+}
+function renderTask(task, theme, phaseName) {
+	const phasePrefix = phaseName === void 0 ? "" : `[${phaseName}] `;
 	switch (task.status) {
-		case "completed": return theme.fg("success", `[x] ${task.id} ${theme.strikethrough(task.content)}`);
-		case "in_progress": return theme.fg("accent", `[>] ${task.id} ${task.content}`);
-		case "abandoned": return theme.fg("dim", `[-] ${task.id} ${theme.strikethrough(task.content)}`);
-		case "blocked": return theme.fg("warning", `[!] ${task.id} ${task.content} (blocked)`);
-		case "pending": return theme.fg("muted", `[ ] ${task.id} ${task.content}`);
+		case "completed": return theme.fg("success", `[x] ${task.id} ${phasePrefix}${theme.strikethrough(task.content)}`);
+		case "in_progress": return theme.fg("accent", `[>] ${task.id} ${phasePrefix}${task.content}`);
+		case "abandoned": return theme.fg("dim", `[-] ${task.id} ${phasePrefix}${theme.strikethrough(task.content)}`);
+		case "blocked": return theme.fg("warning", `[!] ${task.id} ${phasePrefix}${task.content} (blocked)`);
+		case "pending": return theme.fg("muted", `[ ] ${task.id} ${phasePrefix}${task.content}`);
 	}
 }
 // src/watcher/prompts.ts
@@ -846,6 +937,14 @@ const watcherModeSchema = /* @__PURE__ */ picklist([
 	"detached",
 	"ephemeral"
 ]);
+const hudViewSchema = /* @__PURE__ */ picklist([
+	"compact",
+	"expanded",
+	"minimal"
+]);
+function isHudViewMode(value) {
+	return /* @__PURE__ */ is(hudViewSchema, value);
+}
 const detachedModelSpecs = [
 	"@smol",
 	"@tiny",
@@ -968,7 +1067,7 @@ async function loadCompleteSimple() {
 	return completeSimplePromise;
 }
 // src/omp/command.ts
-const peerTodosDescription = "Manage Sidecar Watcher todos & peer sync: /peer-todos [status|model <spec>|mode <auto|detached|ephemeral>|add <task>|done <#id>|reset|pause|resume|broadcast <msg>]";
+const peerTodosDescription = "Manage Sidecar Watcher todos & peer sync: /peer-todos [status|stats|peers|view <compact|expanded|minimal>|model <spec>|mode <auto|detached|ephemeral>|add <task>|done <#id>|drop <#id>|reset|pause|resume|broadcast <msg>]";
 function runPeerTodosCommand(rawArgs, session, ctx) {
 	const { broker, watcher, settings } = session;
 	const trimmed = rawArgs.trim();
@@ -989,7 +1088,8 @@ function runPeerTodosCommand(rawArgs, session, ctx) {
 				level: "warning"
 			} : {
 				message: `Watcher model set to ${modelName}`,
-				level: "info"
+				level: "info",
+				changed: "hud"
 			};
 		}
 		case "mode":
@@ -1000,8 +1100,25 @@ function runPeerTodosCommand(rawArgs, session, ctx) {
 			settings.mode = rest;
 			return {
 				message: `Watcher mode set to ${rest}`,
-				level: "info"
+				level: "info",
+				changed: "hud"
 			};
+		case "view":
+		case "expand":
+		case "collapse":
+		case "minimal": {
+			const targetView = subcommand === "expand" ? "expanded" : subcommand === "collapse" ? "compact" : subcommand === "minimal" ? "minimal" : rest.toLowerCase();
+			if (!isHudViewMode(targetView)) return {
+				message: "Usage: /peer-todos view <compact|expanded|minimal>",
+				level: "warning"
+			};
+			settings.view = targetView;
+			return {
+				message: `Sidecar HUD view set to ${targetView}.`,
+				level: "info",
+				changed: "hud"
+			};
+		}
 		case "add": {
 			const added = watcher.addManualTask(rest);
 			return added ? {
@@ -1017,6 +1134,17 @@ function runPeerTodosCommand(rawArgs, session, ctx) {
 			const completed = watcher.markTaskCompleted(rest);
 			return completed ? {
 				message: `Completed ${completed.id}: ${completed.content}`,
+				level: "info",
+				changed: "todos"
+			} : {
+				message: `No open todo matching "${rest}"`,
+				level: "warning"
+			};
+		}
+		case "drop": {
+			const dropped = watcher.markTaskAbandoned(rest);
+			return dropped ? {
+				message: `Abandoned ${dropped.id}: ${dropped.content}`,
 				level: "info",
 				changed: "todos"
 			} : {
@@ -1048,8 +1176,36 @@ function runPeerTodosCommand(rawArgs, session, ctx) {
 				message: `Broadcast queued for ${broker.broadcastPeerNote(watcher.peerId, rest)} active peer(s).`,
 				level: "info"
 			};
+		case "peers": {
+			const peers = broker.listOtherPeers(watcher.peerId);
+			if (peers.length === 0) return {
+				message: `Peer @${watcher.peerId}: no other active peers.`,
+				level: "info"
+			};
+			const lines = [`Active peers (${peers.length}) alongside @${watcher.peerId}:`, ...peers.map((peer) => `  • @${peer.peerId}: ${peer.completedCount}/${peer.totalCount} done${peer.activeTask === null ? "" : ` — Active: ${peer.activeTask}`}`)];
+			if (watcher.lastPeerSync) lines.push(`Last sync from @${watcher.lastPeerSync.fromPeerId}: ${watcher.lastPeerSync.summary}`);
+			return {
+				message: lines.join("\n"),
+				level: "info"
+			};
+		}
+		case "stats": {
+			const t = watcher.telemetry;
+			const model = resolveDetachedModel(ctx, settings);
+			const resolvedName = model === void 0 ? "session model (ephemeral)" : `${model.provider}/${model.id}`;
+			return {
+				message: [
+					`Sidecar Watcher Telemetry (@${watcher.peerId}, mode=${settings.mode}, view=${settings.view ?? "compact"}):`,
+					`  Model: ${t.lastModelId ?? resolvedName}`,
+					`  Calls: ${t.calls} · Total tokens: ${t.totalTokens} (in=${t.inputTokens}, cacheRead=${t.cacheReadTokens}, cacheWrite=${t.cacheWriteTokens}, out=${t.outputTokens})`,
+					`  Cache hit rate: ${(t.cacheHitRate * 100).toFixed(1)}% overall · ${(t.warmCacheHitRate * 100).toFixed(1)}% warm`,
+					`  Cost: $${t.totalCostUsd.toFixed(4)}${t.lastDurationMs === void 0 ? "" : ` · Last latency: ${t.lastDurationMs}ms`}`
+				].join("\n"),
+				level: "info"
+			};
+		}
 		default: {
-			const lines = renderHudLines(watcher, broker.listOtherPeers(watcher.peerId));
+			const lines = renderHudLines(watcher, broker.listOtherPeers(watcher.peerId), void 0, { view: settings.view ?? "compact" });
 			return {
 				message: lines.length > 0 ? lines.join("\n") : "No active todos or peers.",
 				level: "info"
@@ -3491,6 +3647,7 @@ function createUsageTelemetry() {
 		totalTokens: 0,
 		totalCostUsd: 0,
 		cacheHitRate: 0,
+		warmCacheHitRate: 0,
 		perCallLog: []
 	};
 }
@@ -3498,8 +3655,10 @@ function recordSidecarCall(telemetry, call) {
 	const { input, output, cacheRead, cacheWrite } = call.usage;
 	const totalTokens = call.usage.totalTokens || input + output + cacheRead + cacheWrite;
 	const costUsd = call.usage.cost.total;
+	const durationMs = Math.round(call.durationMs);
 	telemetry.calls++;
 	telemetry.lastModelId = call.modelId;
+	telemetry.lastDurationMs = durationMs;
 	telemetry.mode = telemetry.calls === 1 || telemetry.mode === call.mode ? call.mode : "mixed";
 	telemetry.inputTokens += input;
 	telemetry.outputTokens += output;
@@ -3520,8 +3679,12 @@ function recordSidecarCall(telemetry, call) {
 		totalTokens,
 		cacheHitRate: cacheHitRate(cacheRead, input + cacheRead + cacheWrite),
 		costUsd,
-		durationMs: Math.round(call.durationMs)
+		durationMs
 	});
+	const warmCalls = telemetry.perCallLog.filter((entry, index) => index > 0 || entry.cacheRead > 0);
+	const warmRead = warmCalls.reduce((sum, entry) => sum + entry.cacheRead, 0);
+	const warmInput = warmCalls.reduce((sum, entry) => sum + entry.input + entry.cacheRead, 0);
+	telemetry.warmCacheHitRate = warmRead > 0 ? cacheHitRate(warmRead, warmInput) : telemetry.cacheHitRate;
 }
 function cacheHitRate(cacheReadTokens, promptTokens) {
 	return promptTokens > 0 ? cacheReadTokens / promptTokens : 0;
@@ -3574,6 +3737,7 @@ var SidecarTodoWatcher = class {
 	teamMode;
 	telemetry = createUsageTelemetry();
 	paused = false;
+	lastPeerSync;
 	#broker;
 	#phases = [];
 	#archivedBatches = [];
@@ -3672,6 +3836,13 @@ var SidecarTodoWatcher = class {
 		const task = allTasks(this.#phases).find((candidate) => candidate.status !== "completed" && matchesTodo(candidate, token));
 		if (!task) return void 0;
 		task.status = "completed";
+		this.#updatePhases(normalizePhases(this.#phases));
+		return task;
+	}
+	markTaskAbandoned(token) {
+		const task = allTasks(this.#phases).find((candidate) => isOpen(candidate) && matchesTodo(candidate, token));
+		if (!task) return void 0;
+		task.status = "abandoned";
 		this.#updatePhases(normalizePhases(this.#phases));
 		return task;
 	}
@@ -3813,7 +3984,9 @@ var SidecarTodoWatcher = class {
 		this.#burst.toolActions.push(summarizeVerification(toolName, input, filePaths, output, failed));
 	}
 	#takePendingContext() {
-		const context = [formatPeerSyncNotices(this.#broker.drainInbox(this.peerId)), this.#pendingTailNotices.join("\n")].filter(Boolean).join("\n\n");
+		const drained = this.#broker.drainInbox(this.peerId);
+		if (drained.length > 0) this.lastPeerSync = drained.at(-1);
+		const context = [formatPeerSyncNotices(drained), this.#pendingTailNotices.join("\n")].filter(Boolean).join("\n\n");
 		this.#pendingTailNotices = [];
 		return context || void 0;
 	}
@@ -3963,7 +4136,15 @@ function sidecarTodoWatcherExtension(pi) {
 	}
 	function persistAndRefreshUi(ctx, current) {
 		appendStateEntry(pi, current.watcher);
-		refreshUi(ctx, current);
+		refreshSessionUi(ctx, current);
+	}
+	function refreshSessionUi(ctx, current, checking = false) {
+		refreshUi(ctx, {
+			broker: current.broker,
+			watcher: current.watcher,
+			view: settings.view ?? "compact",
+			checking
+		});
 	}
 	async function collectGitDiff(ctx, files) {
 		const safeFiles = files.filter((file) => !isSensitiveFilePath(file)).slice(0, 10);
@@ -3990,7 +4171,7 @@ function sidecarTodoWatcherExtension(pi) {
 		const activeTools = pi.getActiveTools();
 		if (activeTools.includes("todo")) await pi.setActiveTools(activeTools.filter((tool) => tool !== "todo"));
 		current.watcher.restore(findLatestTodoPhases(ctx.sessionManager.getBranch()));
-		refreshUi(ctx, current);
+		refreshSessionUi(ctx, current);
 	}
 	/** Runs watcher passes off the turn's critical path, one at a time, coalescing requests made meanwhile */
 	function launchWatcherPass(ctx, current) {
@@ -4000,6 +4181,7 @@ function sidecarTodoWatcherExtension(pi) {
 		}
 		const { watcher, ended } = current;
 		const runner = createSidecarRunner(ctx, settings);
+		refreshSessionUi(ctx, current, true);
 		const drain = async () => {
 			do {
 				current.rerunRequested = false;
@@ -4007,11 +4189,13 @@ function sidecarTodoWatcherExtension(pi) {
 				if (await watcher.runPass(runner, {
 					gitDiff,
 					signal: ended.signal
-				})) persistAndRefreshUi(ctx, current);
+				})) appendStateEntry(pi, current.watcher);
+				refreshSessionUi(ctx, current, current.rerunRequested && watcher.isPassDue);
 			} while (current.rerunRequested && watcher.isPassDue);
 		};
 		current.inFlightPass = new Promise((resolve) => ctx.setTimeout(resolve, 0)).then(drain).catch(() => {}).finally(() => {
 			current.inFlightPass = void 0;
+			refreshSessionUi(ctx, current, false);
 		});
 	}
 	pi.setLabel("Sidecar Todo Watcher & Peer Sync");
@@ -4032,6 +4216,7 @@ function sidecarTodoWatcherExtension(pi) {
 			output: outputText(event.content),
 			isError: event.isError
 		});
+		if (additionalContext !== void 0 && session) refreshSessionUi(ctx, session);
 		return additionalContext === void 0 ? void 0 : { additionalContext };
 	});
 	pi.on("turn_end", async (event, ctx) => {
@@ -4075,7 +4260,7 @@ function sidecarTodoWatcherExtension(pi) {
 				settings
 			}, ctx);
 			if (outcome.changed === "todos") persistAndRefreshUi(ctx, current);
-			if (outcome.changed === "hud") refreshUi(ctx, current);
+			if (outcome.changed === "hud") refreshSessionUi(ctx, current);
 			ctx.ui.notify(outcome.message, outcome.level);
 		}
 	});

@@ -179,4 +179,31 @@ describe('sidecar todo watcher extension', () => {
     await reader.emit('session_start', {})
     expect(reader.activeTools).toContain('todo')
   })
+
+  it('anchors the HUD window around the active task and supports view modes and drop command', async () => {
+    const omp = createFakeOmp()
+    await omp.emit('session_start', {})
+    for (let i = 1; i <= 8; i++) {
+      await omp.command(`add Task ${i}`)
+    }
+    for (let i = 1; i <= 5; i++) {
+      await omp.command(`done #${i}`)
+    }
+
+    // With 5 completed and #6 active, the 5-row compact window shifts to keep #6 and #7 visible.
+    expect(omp.widget?.join('\n')).toContain('↑ +3 completed todo(s) above')
+    expect(omp.widget?.join('\n')).toContain('[>] #6 Task 6')
+    expect(omp.widget?.join('\n')).toContain('[ ] #7 Task 7')
+
+    await omp.command('drop #7')
+    expect(omp.widget?.join('\n')).toContain('[-] #7 Task 7')
+
+    await omp.command('view minimal')
+    expect(omp.widget).toHaveLength(1)
+    expect(omp.widget?.[0]).toContain('5/8 done · Active (#6): Task 6')
+
+    await omp.command('expand')
+    expect(omp.widget?.join('\n')).toContain('[x] #1 Task 1')
+    expect(omp.widget?.join('\n')).toContain('[>] #6 Task 6')
+  })
 })

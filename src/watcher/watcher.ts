@@ -1,4 +1,4 @@
-import type { PeerSyncBroker } from '../peer-sync/broker.ts'
+import type { PeerSyncBroker, PeerSyncMessage } from '../peer-sync/broker.ts'
 import type { TodoItem, TodoPhase, TodoPhaseDraft } from '../todos.ts'
 import type { ModelTokenUsage, SidecarMode } from './telemetry.ts'
 import type { ToolInput } from './tool-evidence.ts'
@@ -74,6 +74,7 @@ export class SidecarTodoWatcher {
   readonly teamMode: boolean
   readonly telemetry = createUsageTelemetry()
   paused = false
+  lastPeerSync: PeerSyncMessage | undefined
   readonly #broker: PeerSyncBroker
   #phases: TodoPhase[] = []
   readonly #archivedBatches: TodoPhase[][] = []
@@ -194,6 +195,14 @@ export class SidecarTodoWatcher {
     )
     if (!task) return undefined
     task.status = 'completed'
+    this.#updatePhases(normalizePhases(this.#phases))
+    return task
+  }
+
+  markTaskAbandoned(token: string): TodoItem | undefined {
+    const task = allTasks(this.#phases).find(candidate => isOpen(candidate) && matchesTodo(candidate, token))
+    if (!task) return undefined
+    task.status = 'abandoned'
     this.#updatePhases(normalizePhases(this.#phases))
     return task
   }
@@ -385,7 +394,9 @@ export class SidecarTodoWatcher {
   }
 
   #takePendingContext(): string | undefined {
-    const peerNotices = formatPeerSyncNotices(this.#broker.drainInbox(this.peerId))
+    const drained = this.#broker.drainInbox(this.peerId)
+    if (drained.length > 0) this.lastPeerSync = drained.at(-1)
+    const peerNotices = formatPeerSyncNotices(drained)
     const context = [peerNotices, this.#pendingTailNotices.join('\n')].filter(Boolean).join('\n\n')
     this.#pendingTailNotices = []
     return context || undefined

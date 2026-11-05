@@ -68,7 +68,16 @@ export default function sidecarTodoWatcherExtension(pi: OmpExtensionAPI): void {
 
   function persistAndRefreshUi(ctx: OmpExtensionContext, current: Session): void {
     appendStateEntry(pi, current.watcher)
-    refreshUi(ctx, current)
+    refreshSessionUi(ctx, current)
+  }
+
+  function refreshSessionUi(ctx: OmpExtensionContext, current: Session, checking = false): void {
+    refreshUi(ctx, {
+      broker: current.broker,
+      watcher: current.watcher,
+      view: settings.view ?? 'compact',
+      checking,
+    })
   }
 
   async function collectGitDiff(ctx: OmpExtensionContext, files: readonly string[]): Promise<string | undefined> {
@@ -92,7 +101,7 @@ export default function sidecarTodoWatcherExtension(pi: OmpExtensionAPI): void {
       await pi.setActiveTools(activeTools.filter(tool => tool !== 'todo'))
     }
     current.watcher.restore(findLatestTodoPhases(ctx.sessionManager.getBranch()))
-    refreshUi(ctx, current)
+    refreshSessionUi(ctx, current)
   }
 
   /** Runs watcher passes off the turn's critical path, one at a time, coalescing requests made meanwhile */
@@ -103,11 +112,15 @@ export default function sidecarTodoWatcherExtension(pi: OmpExtensionAPI): void {
     }
     const { watcher, ended } = current
     const runner = createSidecarRunner(ctx, settings)
+    refreshSessionUi(ctx, current, true)
     const drain = async (): Promise<void> => {
       do {
         current.rerunRequested = false
         const gitDiff = await collectGitDiff(ctx, watcher.pendingTouchedFiles)
-        if (await watcher.runPass(runner, { gitDiff, signal: ended.signal })) persistAndRefreshUi(ctx, current)
+        if (await watcher.runPass(runner, { gitDiff, signal: ended.signal })) {
+          appendStateEntry(pi, current.watcher)
+        }
+        refreshSessionUi(ctx, current, current.rerunRequested && watcher.isPassDue)
       } while (current.rerunRequested && watcher.isPassDue)
     }
     current.inFlightPass = new Promise<void>(resolve => ctx.setTimeout(resolve, 0))
@@ -116,6 +129,7 @@ export default function sidecarTodoWatcherExtension(pi: OmpExtensionAPI): void {
       .catch(() => {})
       .finally(() => {
         current.inFlightPass = undefined
+        refreshSessionUi(ctx, current, false)
       })
   }
 
@@ -140,6 +154,7 @@ export default function sidecarTodoWatcherExtension(pi: OmpExtensionAPI): void {
       output: outputText(event.content),
       isError: event.isError,
     })
+    if (additionalContext !== undefined && session) refreshSessionUi(ctx, session)
     return additionalContext === undefined ? undefined : { additionalContext }
   })
 
@@ -182,7 +197,7 @@ export default function sidecarTodoWatcherExtension(pi: OmpExtensionAPI): void {
       const current = sessionFor(ctx)
       const outcome = runPeerTodosCommand(args, { ...current, settings }, ctx)
       if (outcome.changed === 'todos') persistAndRefreshUi(ctx, current)
-      if (outcome.changed === 'hud') refreshUi(ctx, current)
+      if (outcome.changed === 'hud') refreshSessionUi(ctx, current)
       ctx.ui.notify(outcome.message, outcome.level)
     },
   })

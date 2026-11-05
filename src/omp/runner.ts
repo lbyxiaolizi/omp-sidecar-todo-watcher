@@ -5,12 +5,19 @@ import * as v from 'valibot'
 import { sidecarInstructions } from '../watcher/prompts.ts'
 
 export const watcherModeSchema = v.picklist(['auto', 'detached', 'ephemeral'])
+export const hudViewSchema = v.picklist(['compact', 'expanded', 'minimal'])
 
 export type WatcherMode = v.InferOutput<typeof watcherModeSchema>
+export type HudViewMode = v.InferOutput<typeof hudViewSchema>
 
 export interface SidecarSettings {
   modelSpec: string | undefined
   mode: WatcherMode
+  view?: HudViewMode
+}
+
+export function isHudViewMode(value: string): value is HudViewMode {
+  return v.is(hudViewSchema, value)
 }
 
 const detachedModelSpecs = [

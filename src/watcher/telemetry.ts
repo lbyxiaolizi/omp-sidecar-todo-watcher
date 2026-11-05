@@ -20,6 +20,9 @@ export interface SidecarUsageTelemetry {
   totalTokens: number
   totalCostUsd: number
   cacheHitRate: number
+  /** Cache hit rate across warm calls (calls after initial cold cache creation, or calls with cacheRead > 0) */
+  warmCacheHitRate: number
+  lastDurationMs?: number
   perCallLog: Array<{
     callIndex: number
     kind: 'init' | 'delta'
@@ -47,6 +50,7 @@ export function createUsageTelemetry(): SidecarUsageTelemetry {
     totalTokens: 0,
     totalCostUsd: 0,
     cacheHitRate: 0,
+    warmCacheHitRate: 0,
     perCallLog: [],
   }
 }
@@ -64,9 +68,11 @@ export function recordSidecarCall(
   const { input, output, cacheRead, cacheWrite } = call.usage
   const totalTokens = call.usage.totalTokens || input + output + cacheRead + cacheWrite
   const costUsd = call.usage.cost.total
+  const durationMs = Math.round(call.durationMs)
 
   telemetry.calls++
   telemetry.lastModelId = call.modelId
+  telemetry.lastDurationMs = durationMs
   telemetry.mode = telemetry.calls === 1 || telemetry.mode === call.mode ? call.mode : 'mixed'
   telemetry.inputTokens += input
   telemetry.outputTokens += output
@@ -90,8 +96,12 @@ export function recordSidecarCall(
     totalTokens,
     cacheHitRate: cacheHitRate(cacheRead, input + cacheRead + cacheWrite),
     costUsd,
-    durationMs: Math.round(call.durationMs),
+    durationMs,
   })
+  const warmCalls = telemetry.perCallLog.filter((entry, index) => index > 0 || entry.cacheRead > 0)
+  const warmRead = warmCalls.reduce((sum, entry) => sum + entry.cacheRead, 0)
+  const warmInput = warmCalls.reduce((sum, entry) => sum + entry.input + entry.cacheRead, 0)
+  telemetry.warmCacheHitRate = warmRead > 0 ? cacheHitRate(warmRead, warmInput) : telemetry.cacheHitRate
 }
 
 function cacheHitRate(cacheReadTokens: number, promptTokens: number): number {
