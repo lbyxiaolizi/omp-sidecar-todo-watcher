@@ -84,6 +84,7 @@ export class SidecarTodoWatcher {
   #userGoal = ''
   #pendingTailNotices: string[] = []
   #stopBlockCount = 0
+  #consecutiveUncachedReplays = 0
 
   constructor(peerId: string, broker: PeerSyncBroker, options: { teamMode?: boolean } = {}) {
     this.peerId = peerId
@@ -336,6 +337,7 @@ export class SidecarTodoWatcher {
     this.#cumulativeReadFiles.clear()
     this.#cumulativeTouchedFiles.clear()
     this.#transcript = []
+    this.#consecutiveUncachedReplays = 0
     this.#stopBlockCount = 0
     this.#updatePhases(phases)
   }
@@ -411,6 +413,7 @@ export class SidecarTodoWatcher {
     // transcript so a later detached call starts with a fresh opening that includes this turn's changes.
     if (reply.mode !== 'detached-smol') {
       this.#transcript = []
+      this.#consecutiveUncachedReplays = 0
       return verdict
     }
     if (verdict) this.#recordExchange(transcript, { prompt, replyText: reply.replyText }, reply.usage)
@@ -419,14 +422,23 @@ export class SidecarTodoWatcher {
 
   /** Extends `transcript` with the exchange, or starts the list's transcript over when resending it stops paying off */
   #recordExchange(transcript: SidecarExchange[], exchange: SidecarExchange, usage: ModelTokenUsage): void {
-    // A provider that neither served from cache nor wrote to cache on a replay would re-bill the growing
-    // transcript on every call; reset immediately so non-caching providers stay compact.
+    // Load-balanced upstream pools (such as vh2/deepseek-v4.1-flash) can route a single replay to a cold worker;
+    // only reset the transcript after two consecutive uncached replays so one cold hop does not wipe history.
     if (transcript.length > 0 && usage.cacheRead === 0 && usage.cacheWrite === 0) {
-      this.#transcript = []
-      return
+      this.#consecutiveUncachedReplays++
+      if (this.#consecutiveUncachedReplays >= 2) {
+        this.#transcript = []
+        this.#consecutiveUncachedReplays = 0
+        return
+      }
+    } else {
+      this.#consecutiveUncachedReplays = 0
     }
     transcript.push(exchange)
-    if (transcriptTextLength(transcript) > maxTranscriptTextLength) this.#transcript = []
+    if (transcriptTextLength(transcript) > maxTranscriptTextLength) {
+      this.#transcript = []
+      this.#consecutiveUncachedReplays = 0
+    }
   }
 
   /** Moves open tasks named by the sidecar to `status`, returning their contents */

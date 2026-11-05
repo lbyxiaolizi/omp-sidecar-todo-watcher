@@ -81,17 +81,17 @@ describe('sidecarTodoWatcher', () => {
   })
 
   it('starts the transcript over once the provider serves none of a replay from its cache', async () => {
-    const watcher = createWatcher(createBroker(), 'peer-uncached', ['Step A', 'Step B', 'Step C'])
-    const sidecar = fakeSidecar({}, {}, {})
+    const watcher = createWatcher(createBroker(), 'peer-uncached', ['Step A', 'Step B', 'Step C', 'Step D'])
+    const sidecar = fakeSidecar({}, {}, {}, {})
     const uncachedRunner: SidecarRunner = async request => ({ ...(await sidecar.runner(request)), usage: zeroUsage })
 
-    for (const path of ['src/a.ts', 'src/b.ts', 'src/c.ts']) {
+    for (const path of ['src/a.ts', 'src/b.ts', 'src/c.ts', 'src/d.ts']) {
       watcher.onToolResult({ toolName: 'edit', input: { path }, isError: false })
       await watcher.runPass(uncachedRunner)
     }
 
-    expect(sidecar.requests.map(request => request.transcript.length)).toEqual([0, 1, 0])
-    expect(sidecar.requests[2]?.prompt).toContain('Modified files so far: src/a.ts, src/b.ts, src/c.ts')
+    expect(sidecar.requests.map(request => request.transcript.length)).toEqual([0, 1, 2, 0])
+    expect(sidecar.requests[3]?.prompt).toContain('Modified files so far: src/a.ts, src/b.ts, src/c.ts, src/d.ts')
   })
 
   it('keeps the transcript when a replay populates the cache (cacheWrite > 0) and resets after an ephemeral fallback', async () => {

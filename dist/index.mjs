@@ -3584,6 +3584,7 @@ var SidecarTodoWatcher = class {
 	#userGoal = "";
 	#pendingTailNotices = [];
 	#stopBlockCount = 0;
+	#consecutiveUncachedReplays = 0;
 	constructor(peerId, broker, options = {}) {
 		this.peerId = peerId;
 		this.teamMode = options.teamMode ?? false;
@@ -3778,6 +3779,7 @@ var SidecarTodoWatcher = class {
 		this.#cumulativeReadFiles.clear();
 		this.#cumulativeTouchedFiles.clear();
 		this.#transcript = [];
+		this.#consecutiveUncachedReplays = 0;
 		this.#stopBlockCount = 0;
 		this.#updatePhases(phases);
 	}
@@ -3833,6 +3835,7 @@ var SidecarTodoWatcher = class {
 		const verdict = parseSidecarVerdict(reply.replyText);
 		if (reply.mode !== "detached-smol") {
 			this.#transcript = [];
+			this.#consecutiveUncachedReplays = 0;
 			return verdict;
 		}
 		if (verdict) this.#recordExchange(transcript, {
@@ -3844,11 +3847,18 @@ var SidecarTodoWatcher = class {
 	/** Extends `transcript` with the exchange, or starts the list's transcript over when resending it stops paying off */
 	#recordExchange(transcript, exchange, usage) {
 		if (transcript.length > 0 && usage.cacheRead === 0 && usage.cacheWrite === 0) {
-			this.#transcript = [];
-			return;
-		}
+			this.#consecutiveUncachedReplays++;
+			if (this.#consecutiveUncachedReplays >= 2) {
+				this.#transcript = [];
+				this.#consecutiveUncachedReplays = 0;
+				return;
+			}
+		} else this.#consecutiveUncachedReplays = 0;
 		transcript.push(exchange);
-		if (transcriptTextLength(transcript) > maxTranscriptTextLength) this.#transcript = [];
+		if (transcriptTextLength(transcript) > maxTranscriptTextLength) {
+			this.#transcript = [];
+			this.#consecutiveUncachedReplays = 0;
+		}
 	}
 	/** Moves open tasks named by the sidecar to `status`, returning their contents */
 	#transitionOpenTasks(tokens = [], status, isAllowed = () => true) {
